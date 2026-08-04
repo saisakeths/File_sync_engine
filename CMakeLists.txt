@@ -11,9 +11,14 @@ add_executable(${PROJECT_NAME}
     src/config.cpp
     src/storage/LocalStorage.cpp
     src/storage/FileInfo.cpp
+    src/hash/Sha256.cpp
+    src/db/StateDb.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE include)
+
+find_package(SQLite3 REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE SQLite3::SQLite3)
 
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /W4 /permissive-)
