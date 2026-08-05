@@ -13,6 +13,7 @@ add_executable(${PROJECT_NAME}
     src/storage/FileInfo.cpp
     src/hash/Sha256.cpp
     src/db/StateDb.cpp
+    src/utils/TimeUtils.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE include)
