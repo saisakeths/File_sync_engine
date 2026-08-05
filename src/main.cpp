@@ -6,10 +6,33 @@
 #include "utils/TimeUtils.hpp"
 
 #include <filesystem>
+#include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
+
+void runWriteSmokeTest(const std::string& dstPath) {
+    auto& logger = fse::Logger::instance();
+    logger.info("main: running write smoke test");
+
+    LocalStorage dst(dstPath);
+    const std::string relPath = "_smoke_test/write_test.txt";
+    const std::vector<std::uint8_t> payload = {'s', 'y', 'n', 'c', '_', 't', 'e', 's', 't'};
+
+    if (!dst.write(relPath, payload)) {
+        logger.error("main: write smoke test failed at write");
+        return;
+    }
+
+    const std::vector<std::uint8_t> readBack = dst.read(relPath);
+    if (readBack != payload) {
+        logger.error("main: write smoke test failed: readback mismatch");
+        return;
+    }
+
+    logger.info("main: write smoke test passed rel_path=<%s>", relPath.c_str());
+}
 
 void scanAndUpsertSourceFiles(fse::StateDb& stateDb, std::int64_t srcRootId,
                               const std::string& srcPath) {
@@ -92,6 +115,8 @@ int main(int argc, char* argv[]) {
     logger.info("main: stored roots (source id=%lld, destination id=%lld)",
                 static_cast<long long>(srcRootId),
                 static_cast<long long>(dstRootId));
+
+    runWriteSmokeTest(config.dstPath);
 
     scanAndUpsertSourceFiles(stateDb, srcRootId, config.srcPath);
 

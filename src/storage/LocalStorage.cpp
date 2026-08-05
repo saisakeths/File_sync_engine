@@ -97,6 +97,43 @@ std::vector<std::uint8_t> LocalStorage::read(const std::string& relPath) {
     return data;
 }
 
+bool LocalStorage::write(const std::string& relPath,
+                         const std::vector<std::uint8_t>& data) {
+    gLogger.debug("LocalStorage::write:Enter relPath=<%s> bytes=<%zu>",
+                  relPath.c_str(), data.size());
+
+    if (relPath.empty()) {
+        gLogger.debug("LocalStorage::write:Exit (empty relPath)");
+        return false;
+    }
+
+    const fs::path absPath = makeAbsPath(rootPath_, relPath);
+    if (fs::exists(absPath) && fs::is_directory(absPath)) {
+        gLogger.debug("LocalStorage::write:Exit (path is a directory)");
+        return false;
+    }
+
+    const fs::path parentPath = absPath.parent_path();
+    if (!parentPath.empty()) {
+        fs::create_directories(parentPath);
+    }
+
+    std::ofstream file(absPath, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        gLogger.debug("LocalStorage::write:Exit (failed to open file)");
+        return false;
+    }
+
+    if (!data.empty()) {
+        const std::string content(data.begin(), data.end());
+        file.write(content.data(), static_cast<std::streamsize>(content.size()));
+    }
+
+    const bool ok = static_cast<bool>(file);
+    gLogger.debug("LocalStorage::write:Exit ok=<%d>", ok);
+    return ok;
+}
+
 bool LocalStorage::createDirs(const std::string& relPath) {
     gLogger.debug("LocalStorage::createDirs:Enter relPath=<%s>", relPath.c_str());
 

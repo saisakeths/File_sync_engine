@@ -12,6 +12,8 @@ public:
     std::vector<FileInfo> listRecursive() override;
     FileInfo stat(const std::string& relPath) override;
     std::vector<std::uint8_t> read(const std::string& relPath) override;
+    bool write(const std::string& relPath,
+               const std::vector<std::uint8_t>& data) override;
     bool createDirs(const std::string& relPath) override;
 
 private:
