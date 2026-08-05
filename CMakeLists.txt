@@ -14,6 +14,7 @@ add_executable(${PROJECT_NAME}
     src/hash/Sha256.cpp
     src/db/StateDb.cpp
     src/utils/TimeUtils.cpp
+    src/sync/SyncBox.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE include)

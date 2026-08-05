@@ -1,85 +1,12 @@
 #include "config.hpp"
 #include "db/StateDb.hpp"
-#include "hash/Sha256.hpp"
 #include "logger.hpp"
 #include "storage/LocalStorage.hpp"
-#include "utils/TimeUtils.hpp"
+#include "sync/SyncBox.hpp"
 
 #include <filesystem>
-#include <vector>
 
 namespace fs = std::filesystem;
-
-namespace {
-
-void runWriteSmokeTest(const std::string& dstPath) {
-    auto& logger = fse::Logger::instance();
-    logger.info("main: running write smoke test");
-
-    LocalStorage dst(dstPath);
-    const std::string relPath = "_smoke_test/write_test.txt";
-    const std::vector<std::uint8_t> payload = {'s', 'y', 'n', 'c', '_', 't', 'e', 's', 't'};
-
-    if (!dst.write(relPath, payload)) {
-        logger.error("main: write smoke test failed at write");
-        return;
-    }
-
-    const std::vector<std::uint8_t> readBack = dst.read(relPath);
-    if (readBack != payload) {
-        logger.error("main: write smoke test failed: readback mismatch");
-        return;
-    }
-
-    logger.info("main: write smoke test passed rel_path=<%s>", relPath.c_str());
-}
-
-void scanAndUpsertSourceFiles(fse::StateDb& stateDb, std::int64_t srcRootId,
-                              const std::string& srcPath) {
-    auto& logger = fse::Logger::instance();
-    logger.info("main: scanning source path <%s>", srcPath.c_str());
-
-    LocalStorage storage(srcPath);
-    const auto entries = storage.listRecursive();
-
-    std::size_t upserted = 0;
-    for (const auto& info : entries) {
-        fse::FileRecord record;
-        record.rootId = srcRootId;
-        record.relPath = info.relPath;
-        record.isDirectory = info.isDirectory;
-        record.mtime = fse::fileTimeToUnixSeconds(info.lastModified);
-
-        if (info.isDirectory) {
-            record.size = std::nullopt;
-            record.hash = std::nullopt;
-            record.syncStatus = fse::FileSyncStatus::kSkipped;
-        } else {
-            record.size = static_cast<std::int64_t>(info.size);
-            record.syncStatus = fse::FileSyncStatus::kPending;
-
-            const fs::path absPath = fs::path(srcPath) / info.relPath;
-            if (const auto hash = fse::hashFile(absPath)) {
-                record.hash = *hash;
-            } else {
-                logger.warning("main: failed to hash <%s>", info.relPath.c_str());
-                record.hash = std::nullopt;
-            }
-        }
-
-        if (stateDb.upsertFile(record) < 0) {
-            logger.error("main: upsert failed for <%s>", info.relPath.c_str());
-            continue;
-        }
-
-        ++upserted;
-    }
-
-    logger.info("main: upserted %zu / %zu entries for source root",
-                upserted, entries.size());
-}
-
-}  // namespace
 
 int main(int argc, char* argv[]) {
     auto& logger = fse::Logger::instance();
@@ -116,9 +43,11 @@ int main(int argc, char* argv[]) {
                 static_cast<long long>(srcRootId),
                 static_cast<long long>(dstRootId));
 
-    runWriteSmokeTest(config.dstPath);
+    LocalStorage srcStorage(config.srcPath);
+    LocalStorage dstStorage(config.dstPath);
 
-    scanAndUpsertSourceFiles(stateDb, srcRootId, config.srcPath);
+    fse::SyncBox syncBox(stateDb, srcStorage, dstStorage, srcRootId, config.srcPath);
+    syncBox.run();
 
     return 0;
 }
