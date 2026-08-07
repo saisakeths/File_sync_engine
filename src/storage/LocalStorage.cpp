@@ -143,3 +143,28 @@ bool LocalStorage::createDirs(const std::string& relPath) {
     gLogger.debug("LocalStorage::createDirs:Exit created=<%d>", created);
     return created;
 }
+
+bool LocalStorage::remove(const std::string& relPath) {
+    gLogger.debug("LocalStorage::remove:Enter relPath=<%s>", relPath.c_str());
+
+    if (relPath.empty()) {
+        gLogger.debug("LocalStorage::remove:Exit (empty relPath)");
+        return false;
+    }
+
+    const fs::path absPath = makeAbsPath(rootPath_, relPath);
+    if (!fs::exists(absPath)) {
+        gLogger.debug("LocalStorage::remove:Exit (path missing, ok)");
+        return true;
+    }
+
+    std::error_code ec;
+    const bool removed = fs::remove(absPath, ec);
+    if (ec) {
+        gLogger.debug("LocalStorage::remove:Exit (error) <%s>", ec.message().c_str());
+        return false;
+    }
+
+    gLogger.debug("LocalStorage::remove:Exit removed=<%d>", removed);
+    return true;
+}

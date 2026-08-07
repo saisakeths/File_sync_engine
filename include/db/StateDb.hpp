@@ -38,6 +38,7 @@ inline constexpr const char* kPending = "pending";
 inline constexpr const char* kSynced = "synced";
 inline constexpr const char* kFailed = "failed";
 inline constexpr const char* kSkipped = "skipped";
+inline constexpr const char* kDeleted = "deleted";
 }  // namespace FileSyncStatus
 
 class StateDb {

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <unordered_set>
 #include <vector>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
@@ -63,7 +64,7 @@ void SyncBox::scan() {
         if (info.isDirectory) {
             record.size = std::nullopt;
             record.hash = std::nullopt;
-            record.syncStatus = FileSyncStatus::kSkipped;
+            record.syncStatus = FileSyncStatus::kPending;
         } else {
             record.size = static_cast<std::int64_t>(info.size);
 
@@ -101,27 +102,66 @@ void SyncBox::scan() {
         ++upserted;
     }
 
-    std::size_t deleted = 0;
+    std::size_t markedDeleted = 0;
     for (const auto& dbFile : db_.listFilesByRoot(srcRootId_)) {
         if (seenPaths.find(dbFile.relPath) != seenPaths.end()) {
             continue;
         }
 
-        if (db_.deleteFile(srcRootId_, dbFile.relPath)) {
-            ++deleted;
+        if (dbFile.syncStatus == FileSyncStatus::kDeleted) {
+            continue;
+        }
+
+        if (db_.updateSyncStatus(srcRootId_, dbFile.relPath, FileSyncStatus::kDeleted)) {
+            ++markedDeleted;
         } else {
-            logger.error("SyncBox::scan: delete failed for <%s>", dbFile.relPath.c_str());
+            logger.error("SyncBox::scan: mark deleted failed for <%s>",
+                         dbFile.relPath.c_str());
         }
     }
 
     logger.info(
-        "SyncBox::scan: scanned=%zu upserted=%zu unchanged=%zu deleted=%zu",
-        entries.size(), upserted, unchanged, deleted);
+        "SyncBox::scan: scanned=%zu upserted=%zu unchanged=%zu marked_deleted=%zu",
+        entries.size(), upserted, unchanged, markedDeleted);
 }
 
 void SyncBox::sync() {
     auto& logger = Logger::instance();
-    logger.info("SyncBox::sync: syncing pending files");
+    logger.info("SyncBox::sync: syncing deleted and pending files");
+
+    std::size_t deleted = 0;
+    std::size_t deleteFailed = 0;
+
+    std::vector<FileRecord> deletedFiles =
+        db_.listFilesByStatus(FileSyncStatus::kDeleted);
+    deletedFiles.erase(
+        std::remove_if(deletedFiles.begin(), deletedFiles.end(),
+                       [this](const FileRecord& file) {
+                           return file.rootId != srcRootId_;
+                       }),
+        deletedFiles.end());
+    std::sort(deletedFiles.begin(), deletedFiles.end(),
+              [](const FileRecord& a, const FileRecord& b) {
+                  return a.relPath.size() > b.relPath.size();
+              });
+
+    for (const auto& file : deletedFiles) {
+        if (!destination_.remove(file.relPath)) {
+            logger.error("SyncBox::sync: dest remove failed for <%s>",
+                         file.relPath.c_str());
+            ++deleteFailed;
+            continue;
+        }
+
+        if (!db_.deleteFile(srcRootId_, file.relPath)) {
+            logger.error("SyncBox::sync: delete row failed for <%s>",
+                         file.relPath.c_str());
+            ++deleteFailed;
+            continue;
+        }
+
+        ++deleted;
+    }
 
     const auto pendingFiles = db_.listFilesByStatus(FileSyncStatus::kPending);
 
@@ -136,8 +176,8 @@ void SyncBox::sync() {
 
         if (file.isDirectory) {
             if (destination_.createDirs(file.relPath)) {
-                db_.updateSyncStatus(srcRootId_, file.relPath, FileSyncStatus::kSkipped);
-                ++skipped;
+                db_.updateSyncStatus(srcRootId_, file.relPath, FileSyncStatus::kSynced);
+                ++copied;
             } else {
                 db_.updateSyncStatus(srcRootId_, file.relPath, FileSyncStatus::kFailed);
                 logger.error("SyncBox::sync: createDirs failed for <%s>",
@@ -174,8 +214,8 @@ void SyncBox::sync() {
         ++copied;
     }
 
-    logger.info("SyncBox::sync: copied=%zu failed=%zu skipped=%zu",
-                copied, failed, skipped);
+    logger.info("SyncBox::sync: deleted=%zu delete_failed=%zu copied=%zu failed=%zu skipped=%zu",
+                deleted, deleteFailed, copied, failed, skipped);
 }
 
 void SyncBox::run() {

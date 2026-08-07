@@ -13,7 +13,7 @@ Logger& Logger::instance() {
     return logger;
 }
 
-Logger::Logger() : minLevel_(LogLevel::Debug), consoleOutput_(true) {
+Logger::Logger() : minLevel_(LogLevel::Debug), consoleOutput_(false) {
     setLogFile("logs/sync_engine.log");
 }
 

@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS files (
     size            INTEGER,
     hash            TEXT,
     sync_status     TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(sync_status IN ('pending', 'synced', 'failed', 'skipped')),
+                    CHECK(sync_status IN ('pending', 'synced', 'failed', 'skipped', 'deleted')),
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     UNIQUE(root_id, rel_path),

@@ -15,6 +15,7 @@ public:
     bool write(const std::string& relPath,
                const std::vector<std::uint8_t>& data) override;
     bool createDirs(const std::string& relPath) override;
+    bool remove(const std::string& relPath) override;
 
 private:
     std::string rootPath_;

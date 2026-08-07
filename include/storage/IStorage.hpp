@@ -17,4 +17,5 @@ public:
     virtual bool write(const std::string& relPath,
                        const std::vector<std::uint8_t>& data) = 0;
     virtual bool createDirs(const std::string& relPath) = 0;
+    virtual bool remove(const std::string& relPath) = 0;
 };
