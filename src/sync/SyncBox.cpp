@@ -4,6 +4,7 @@
 #include "logger.hpp"
 #include "utils/TimeUtils.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <unordered_set>
 #include <vector>
@@ -219,8 +220,29 @@ void SyncBox::sync() {
 }
 
 void SyncBox::run() {
+    using clock = std::chrono::steady_clock;
+    const auto runStart = clock::now();
+
+    const auto scanStart = clock::now();
     scan();
+    const auto scanMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - scanStart)
+            .count();
+
+    const auto syncStart = clock::now();
     sync();
+    const auto syncMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - syncStart)
+            .count();
+
+    const auto totalMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - runStart)
+            .count();
+
+    Logger::instance().info(
+        "SyncBox::run: scan_ms=%lld sync_ms=%lld total_ms=%lld",
+        static_cast<long long>(scanMs), static_cast<long long>(syncMs),
+        static_cast<long long>(totalMs));
 }
 
 }  // namespace fse
