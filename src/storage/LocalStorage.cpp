@@ -134,6 +134,143 @@ bool LocalStorage::write(const std::string& relPath,
     return ok;
 }
 
+std::size_t LocalStorage::readRange(const std::string& relPath,
+                                    std::int64_t offset,
+                                    std::uint8_t* buffer,
+                                    std::size_t bufferSize) {
+    gLogger.debug("LocalStorage::readRange:Enter relPath=<%s> offset=<%lld> size=<%zu>",
+                  relPath.c_str(), static_cast<long long>(offset), bufferSize);
+
+    if (buffer == nullptr || bufferSize == 0 || offset < 0) {
+        gLogger.debug("LocalStorage::readRange:Exit (invalid args)");
+        return 0;
+    }
+
+    const fs::path absPath = makeAbsPath(rootPath_, relPath);
+    std::ifstream file(absPath, std::ios::binary);
+    if (!file) {
+        gLogger.debug("LocalStorage::readRange:Exit (file not found)");
+        return 0;
+    }
+
+    file.seekg(offset, std::ios::beg);
+    if (!file) {
+        gLogger.debug("LocalStorage::readRange:Exit (seek failed)");
+        return 0;
+    }
+
+    file.read(reinterpret_cast<char*>(buffer),
+              static_cast<std::streamsize>(bufferSize));
+    if (file.bad()) {
+        gLogger.debug("LocalStorage::readRange:Exit (read failed)");
+        return 0;
+    }
+
+    const std::size_t bytesRead = static_cast<std::size_t>(file.gcount());
+    gLogger.debug("LocalStorage::readRange:Exit bytes=<%zu>", bytesRead);
+    return bytesRead;
+}
+
+bool LocalStorage::writeRange(const std::string& relPath,
+                              std::int64_t offset,
+                              const std::uint8_t* data,
+                              std::size_t dataSize,
+                              bool create) {
+    gLogger.debug(
+        "LocalStorage::writeRange:Enter relPath=<%s> offset=<%lld> size=<%zu> create=<%d>",
+        relPath.c_str(), static_cast<long long>(offset), dataSize, create ? 1 : 0);
+
+    if (relPath.empty() || offset < 0) {
+        gLogger.debug("LocalStorage::writeRange:Exit (invalid args)");
+        return false;
+    }
+
+    if (dataSize > 0 && data == nullptr) {
+        gLogger.debug("LocalStorage::writeRange:Exit (null data)");
+        return false;
+    }
+
+    const fs::path absPath = makeAbsPath(rootPath_, relPath);
+    if (fs::exists(absPath) && fs::is_directory(absPath)) {
+        gLogger.debug("LocalStorage::writeRange:Exit (path is a directory)");
+        return false;
+    }
+
+    const fs::path parentPath = absPath.parent_path();
+    if (!parentPath.empty()) {
+        fs::create_directories(parentPath);
+    }
+
+    std::ios::openmode mode = std::ios::binary;
+    if (create && offset == 0) {
+        mode |= std::ios::out | std::ios::trunc;
+    } else {
+        mode |= std::ios::in | std::ios::out;
+    }
+
+    std::fstream file(absPath, mode);
+    if (!file) {
+        gLogger.debug("LocalStorage::writeRange:Exit (failed to open file)");
+        return false;
+    }
+
+    if (!(create && offset == 0)) {
+        file.seekp(offset, std::ios::beg);
+        if (!file) {
+            gLogger.debug("LocalStorage::writeRange:Exit (seek failed)");
+            return false;
+        }
+    }
+
+    if (dataSize > 0) {
+        file.write(reinterpret_cast<const char*>(data),
+                   static_cast<std::streamsize>(dataSize));
+    }
+
+    const bool ok = static_cast<bool>(file);
+    gLogger.debug("LocalStorage::writeRange:Exit ok=<%d>", ok);
+    return ok;
+}
+
+bool LocalStorage::rename(const std::string& fromRelPath,
+                          const std::string& toRelPath) {
+    gLogger.debug("LocalStorage::rename:Enter from=<%s> to=<%s>",
+                  fromRelPath.c_str(), toRelPath.c_str());
+
+    if (fromRelPath.empty() || toRelPath.empty()) {
+        gLogger.debug("LocalStorage::rename:Exit (empty path)");
+        return false;
+    }
+
+    const fs::path fromAbs = makeAbsPath(rootPath_, fromRelPath);
+    const fs::path toAbs = makeAbsPath(rootPath_, toRelPath);
+
+    if (!fs::exists(fromAbs)) {
+        gLogger.debug("LocalStorage::rename:Exit (source missing)");
+        return false;
+    }
+
+    if (fs::exists(toAbs) && fs::is_directory(toAbs)) {
+        gLogger.debug("LocalStorage::rename:Exit (destination is a directory)");
+        return false;
+    }
+
+    const fs::path parentPath = toAbs.parent_path();
+    if (!parentPath.empty()) {
+        fs::create_directories(parentPath);
+    }
+
+    std::error_code ec;
+    fs::rename(fromAbs, toAbs, ec);
+    if (ec) {
+        gLogger.debug("LocalStorage::rename:Exit (error) <%s>", ec.message().c_str());
+        return false;
+    }
+
+    gLogger.debug("LocalStorage::rename:Exit ok");
+    return true;
+}
+
 bool LocalStorage::createDirs(const std::string& relPath) {
     gLogger.debug("LocalStorage::createDirs:Enter relPath=<%s>", relPath.c_str());
 
