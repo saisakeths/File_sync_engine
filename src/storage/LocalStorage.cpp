@@ -275,6 +275,10 @@ bool LocalStorage::createDirs(const std::string& relPath) {
     gLogger.debug("LocalStorage::createDirs:Enter relPath=<%s>", relPath.c_str());
 
     const fs::path absPath = makeAbsPath(rootPath_, relPath);
+    if(fs::exists(absPath)){
+        gLogger.debug("LocalStorage::createDirs:Directory already present path=<%s>", relPath);
+        return true;
+    }
     const bool created = fs::create_directories(absPath);
 
     gLogger.debug("LocalStorage::createDirs:Exit created=<%d>", created);

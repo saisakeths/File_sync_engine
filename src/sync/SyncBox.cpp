@@ -1,7 +1,9 @@
 #include "sync/SyncBox.hpp"
 
+#include "config.hpp"
 #include "hash/Sha256.hpp"
 #include "logger.hpp"
+#include "sync/ChunkCopier.hpp"
 #include "utils/TimeUtils.hpp"
 
 #include <chrono>
@@ -24,7 +26,129 @@ bool metadataChanged(const std::optional<FileRecord>& existing,
         return true;
     }
 
+    auto& logger = Logger::instance();
+    logger.error("metadataChanged:: path=<%s>, mtime=<%d>, size=<%d>, hash=<%d>",
+                 existing->relPath.c_str(), existing->mtime != mtime,
+                 existing->size != size, existing->hash != hash);
+
     return existing->mtime != mtime || existing->size != size || existing->hash != hash;
+}
+
+std::int64_t resolveResumeOffset(IStorage& destination,
+                                 const FileRecord& file,
+                                 const std::string& tempRelPath) {
+    const bool tempExists = destination.exist(tempRelPath);
+    std::int64_t tempSize = 0;
+    if (tempExists) {
+        tempSize = static_cast<std::int64_t>(destination.stat(tempRelPath).size);
+    }
+
+    if (file.syncStatus == FileSyncStatus::kSyncing && tempExists &&
+        tempSize == file.bytesTransferred) {
+        return file.bytesTransferred;
+    }
+
+    if (tempExists) {
+        destination.remove(tempRelPath);
+    }
+
+    return 0;
+}
+
+bool markSynced(StateDb& db, std::int64_t rootId, const std::string& relPath) {
+    const auto record = db.getFile(rootId, relPath);
+    if (!record.has_value()) {
+        return false;
+    }
+
+    FileRecord updated = *record;
+    updated.syncStatus = FileSyncStatus::kSynced;
+    updated.bytesTransferred = 0;
+    return db.upsertFile(updated) >= 0;
+}
+
+bool syncZeroByteFile(IStorage& source,
+                      IStorage& destination,
+                      StateDb& db,
+                      std::int64_t rootId,
+                      const FileRecord& file) {
+    auto& logger = Logger::instance();
+    const std::vector<std::uint8_t> data = source.read(file.relPath);
+    if (!data.empty()) {
+        db.updateSyncStatus(rootId, file.relPath, FileSyncStatus::kFailed);
+        logger.error("SyncBox::sync: zero-byte read returned data for <%s>",
+                     file.relPath.c_str());
+        return false;
+    }
+
+    if (!destination.write(file.relPath, data)) {
+        db.updateSyncStatus(rootId, file.relPath, FileSyncStatus::kFailed);
+        logger.error("SyncBox::sync: zero-byte write failed for <%s>",
+                     file.relPath.c_str());
+        return false;
+    }
+
+    if (!markSynced(db, rootId, file.relPath)) {
+        logger.error("SyncBox::sync: failed to mark synced for <%s>",
+                     file.relPath.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool syncFileChunked(IStorage& source,
+                     IStorage& destination,
+                     StateDb& db,
+                     const FileRecord& file) {
+    auto& logger = Logger::instance();
+    const std::string tempRelPath = makeTempRelPath(file.relPath);
+    const std::int64_t startOffset =
+        resolveResumeOffset(destination, file, tempRelPath);
+
+    if (!db.updateTransferProgress(file.rootId, file.relPath, startOffset)) {
+        logger.error("SyncBox::sync: failed to mark syncing for <%s>",
+                     file.relPath.c_str());
+        return false;
+    }
+
+    const ChunkCopyResult copyResult = copyFileChunked(
+        source, destination, file, Config::kChunkSize, startOffset, tempRelPath,
+        db, 1);
+
+    if (!copyResult.ok) {
+        destination.remove(tempRelPath);
+        db.updateSyncStatus(file.rootId, file.relPath, FileSyncStatus::kFailed);
+        logger.error("SyncBox::sync: chunked copy failed for <%s>: %s",
+                     file.relPath.c_str(), copyResult.error.c_str());
+        return false;
+    }
+
+    if (destination.exist(file.relPath)) {
+        if (!destination.remove(file.relPath)) {
+            destination.remove(tempRelPath);
+            db.updateSyncStatus(file.rootId, file.relPath, FileSyncStatus::kFailed);
+            logger.error("SyncBox::sync: failed to remove existing dest for <%s>",
+                         file.relPath.c_str());
+            return false;
+        }
+    }
+
+    if (!destination.rename(tempRelPath, file.relPath)) {
+        destination.remove(tempRelPath);
+        db.updateSyncStatus(file.rootId, file.relPath, FileSyncStatus::kFailed);
+        logger.error("SyncBox::sync: atomic rename failed for <%s>",
+                     file.relPath.c_str());
+        return false;
+    }
+
+    if (!markSynced(db, file.rootId, file.relPath)) {
+        logger.error("SyncBox::sync: failed to mark synced for <%s>",
+                     file.relPath.c_str());
+        return false;
+    }
+
+    return true;
 }
 
 }  // namespace
@@ -89,8 +213,10 @@ void SyncBox::scan() {
 
             if (metadataChanged(existing, record.mtime, record.size, record.hash)) {
                 record.syncStatus = FileSyncStatus::kPending;
+                record.bytesTransferred = 0;
             } else {
                 record.syncStatus = existing->syncStatus;
+                record.bytesTransferred = existing->bytesTransferred;
                 ++unchanged;
             }
         }
@@ -147,6 +273,8 @@ void SyncBox::sync() {
               });
 
     for (const auto& file : deletedFiles) {
+        destination_.remove(makeTempRelPath(file.relPath));
+
         if (!destination_.remove(file.relPath)) {
             logger.error("SyncBox::sync: dest remove failed for <%s>",
                          file.relPath.c_str());
@@ -164,13 +292,16 @@ void SyncBox::sync() {
         ++deleted;
     }
 
-    const auto pendingFiles = db_.listFilesByStatus(FileSyncStatus::kPending);
+    std::vector<FileRecord> filesToSync =
+        db_.listFilesByStatus(FileSyncStatus::kPending);
+    const auto syncingFiles = db_.listFilesByStatus(FileSyncStatus::kSyncing);
+    filesToSync.insert(filesToSync.end(), syncingFiles.begin(), syncingFiles.end());
 
     std::size_t copied = 0;
     std::size_t failed = 0;
     std::size_t skipped = 0;
 
-    for (const auto& file : pendingFiles) {
+    for (const auto& file : filesToSync) {
         if (file.rootId != srcRootId_) {
             continue;
         }
@@ -189,30 +320,24 @@ void SyncBox::sync() {
         }
 
         if (!source_.exist(file.relPath)) {
+            destination_.remove(makeTempRelPath(file.relPath));
             db_.updateSyncStatus(srcRootId_, file.relPath, FileSyncStatus::kFailed);
             logger.error("SyncBox::sync: source missing <%s>", file.relPath.c_str());
             ++failed;
             continue;
         }
 
-        const std::vector<std::uint8_t> data = source_.read(file.relPath);
-        const bool expectContent = file.size.has_value() && *file.size > 0;
-        if (data.empty() && expectContent) {
-            db_.updateSyncStatus(srcRootId_, file.relPath, FileSyncStatus::kFailed);
-            logger.error("SyncBox::sync: read failed for <%s>", file.relPath.c_str());
-            ++failed;
-            continue;
-        }
+        const bool isZeroByteFile = file.size.has_value() && *file.size == 0;
+        const bool synced =
+            isZeroByteFile
+                ? syncZeroByteFile(source_, destination_, db_, srcRootId_, file)
+                : syncFileChunked(source_, destination_, db_, file);
 
-        if (!destination_.write(file.relPath, data)) {
-            db_.updateSyncStatus(srcRootId_, file.relPath, FileSyncStatus::kFailed);
-            logger.error("SyncBox::sync: write failed for <%s>", file.relPath.c_str());
+        if (synced) {
+            ++copied;
+        } else {
             ++failed;
-            continue;
         }
-
-        db_.updateSyncStatus(srcRootId_, file.relPath, FileSyncStatus::kSynced);
-        ++copied;
     }
 
     logger.info("SyncBox::sync: deleted=%zu delete_failed=%zu copied=%zu failed=%zu skipped=%zu",

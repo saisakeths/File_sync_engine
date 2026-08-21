@@ -21,17 +21,18 @@ CREATE TABLE IF NOT EXISTS roots (
 
 constexpr const char* kCreateFilesTableSql = R"(
 CREATE TABLE IF NOT EXISTS files (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    root_id         INTEGER NOT NULL,
-    rel_path        TEXT NOT NULL,
-    is_directory    INTEGER NOT NULL DEFAULT 0 CHECK(is_directory IN (0, 1)),
-    mtime           INTEGER,
-    size            INTEGER,
-    hash            TEXT,
-    sync_status     TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(sync_status IN ('pending', 'synced', 'failed', 'skipped', 'deleted')),
-    created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id             INTEGER NOT NULL,
+    rel_path            TEXT NOT NULL,
+    is_directory        INTEGER NOT NULL DEFAULT 0 CHECK(is_directory IN (0, 1)),
+    mtime               INTEGER,
+    size                INTEGER,
+    hash                TEXT,
+    sync_status         TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(sync_status IN ('pending', 'syncing', 'synced', 'failed', 'skipped', 'deleted')),
+    bytes_transferred   INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
     UNIQUE(root_id, rel_path),
     FOREIGN KEY(root_id) REFERENCES roots(id) ON DELETE CASCADE
 );
@@ -55,6 +56,89 @@ bool execSql(sqlite3* db, const char* sql, const char* context) {
         return false;
     }
 
+    return true;
+}
+
+bool columnExists(sqlite3* db, const char* table, const char* column) {
+    const std::string pragmaSql =
+        std::string("PRAGMA table_info(") + table + ");";
+
+    sqlite3_stmt* statement = nullptr;
+    if (sqlite3_prepare_v2(db, pragmaSql.c_str(), -1, &statement, nullptr) !=
+        SQLITE_OK) {
+        return false;
+    }
+
+    bool found = false;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const char* name =
+            reinterpret_cast<const char*>(sqlite3_column_text(statement, 1));
+        if (name != nullptr && column == std::string(name)) {
+            found = true;
+            break;
+        }
+    }
+
+    sqlite3_finalize(statement);
+    return found;
+}
+
+bool migrateFilesTableV2(sqlite3* db) {
+    auto& logger = Logger::instance();
+
+    if (columnExists(db, "files", "bytes_transferred")) {
+        return true;
+    }
+
+    logger.info("StateDb::migrate: upgrading files table to v2");
+
+    constexpr const char* kCreateFilesTableV2Sql = R"(
+CREATE TABLE files_v2 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id             INTEGER NOT NULL,
+    rel_path            TEXT NOT NULL,
+    is_directory        INTEGER NOT NULL DEFAULT 0 CHECK(is_directory IN (0, 1)),
+    mtime               INTEGER,
+    size                INTEGER,
+    hash                TEXT,
+    sync_status         TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(sync_status IN ('pending', 'syncing', 'synced', 'failed', 'skipped', 'deleted')),
+    bytes_transferred   INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    UNIQUE(root_id, rel_path),
+    FOREIGN KEY(root_id) REFERENCES roots(id) ON DELETE CASCADE
+);
+)";
+
+    constexpr const char* kCopyFilesV2Sql = R"(
+INSERT INTO files_v2 (
+    id, root_id, rel_path, is_directory, mtime, size, hash,
+    sync_status, bytes_transferred, created_at, updated_at
+)
+SELECT id, root_id, rel_path, is_directory, mtime, size, hash,
+       sync_status, 0, created_at, updated_at
+FROM files;
+)";
+
+    if (!execSql(db, kCreateFilesTableV2Sql, "migrateFilesTableV2:create")) {
+        return false;
+    }
+    if (!execSql(db, kCopyFilesV2Sql, "migrateFilesTableV2:copy")) {
+        return false;
+    }
+    if (!execSql(db, "DROP TABLE files;", "migrateFilesTableV2:drop")) {
+        return false;
+    }
+    if (!execSql(db, "ALTER TABLE files_v2 RENAME TO files;",
+                 "migrateFilesTableV2:rename")) {
+        return false;
+    }
+    if (!execSql(db, kCreateFilesIndexesSql, "migrateFilesTableV2:indexes")) {
+        return false;
+    }
+
+    logger.info("StateDb::migrate: files table upgraded to v2");
     return true;
 }
 
@@ -106,14 +190,15 @@ FileRecord rowToFileRecord(sqlite3_stmt* statement) {
     record.size = readOptionalInt64(statement, 5);
     record.hash = readOptionalText(statement, 6);
     record.syncStatus = reinterpret_cast<const char*>(sqlite3_column_text(statement, 7));
-    record.createdAt = sqlite3_column_int64(statement, 8);
-    record.updatedAt = sqlite3_column_int64(statement, 9);
+    record.bytesTransferred = sqlite3_column_int64(statement, 8);
+    record.createdAt = sqlite3_column_int64(statement, 9);
+    record.updatedAt = sqlite3_column_int64(statement, 10);
     return record;
 }
 
 constexpr const char* kSelectFileColumns = R"(
 SELECT id, root_id, rel_path, is_directory, mtime, size, hash,
-       sync_status, created_at, updated_at
+       sync_status, bytes_transferred, created_at, updated_at
 )";
 
 }  // namespace
@@ -168,6 +253,10 @@ bool StateDb::migrate() {
         return false;
     }
     logger.info("StateDb::migrate: files table ready");
+
+    if (!migrateFilesTableV2(db_)) {
+        return false;
+    }
 
     if (!execSql(db_, kCreateFilesIndexesSql, "migrate")) {
         return false;
@@ -284,15 +373,19 @@ std::int64_t StateDb::upsertFile(const FileRecord& file) {
     const char* upsertSql = R"(
 INSERT INTO files (
     root_id, rel_path, is_directory, mtime, size, hash,
-    sync_status, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    sync_status, bytes_transferred, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(root_id, rel_path) DO UPDATE SET
-    is_directory = excluded.is_directory,
-    mtime        = excluded.mtime,
-    size         = excluded.size,
-    hash         = excluded.hash,
-    sync_status  = excluded.sync_status,
-    updated_at   = excluded.updated_at;
+    is_directory      = excluded.is_directory,
+    mtime             = excluded.mtime,
+    size              = excluded.size,
+    hash              = excluded.hash,
+    sync_status       = excluded.sync_status,
+    bytes_transferred = CASE
+        WHEN excluded.sync_status = 'pending' THEN 0
+        ELSE excluded.bytes_transferred
+    END,
+    updated_at        = excluded.updated_at;
 )";
 
     sqlite3_stmt* statement = nullptr;
@@ -308,8 +401,9 @@ ON CONFLICT(root_id, rel_path) DO UPDATE SET
     bindOptionalInt64(statement, 5, file.size);
     bindOptionalText(statement, 6, file.hash);
     sqlite3_bind_text(statement, 7, file.syncStatus.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(statement, 8, createdAt);
-    sqlite3_bind_int64(statement, 9, updatedAt);
+    sqlite3_bind_int64(statement, 8, file.bytesTransferred);
+    sqlite3_bind_int64(statement, 9, createdAt);
+    sqlite3_bind_int64(statement, 10, updatedAt);
 
     if (sqlite3_step(statement) != SQLITE_DONE) {
         logger.error("StateDb::upsertFile: step failed: %s", sqlite3_errmsg(db_));
@@ -465,6 +559,57 @@ WHERE root_id = ? AND rel_path = ?;
     if (!updated) {
         logger.error(
             "StateDb::updateSyncStatus: no row updated root_id=<%lld> rel_path=<%s>",
+            static_cast<long long>(rootId), relPath.c_str());
+    }
+
+    return updated;
+}
+
+bool StateDb::updateTransferProgress(std::int64_t rootId, const std::string& relPath,
+                                     std::int64_t bytesTransferred) {
+    if (db_ == nullptr) {
+        return false;
+    }
+
+    if (bytesTransferred < 0) {
+        return false;
+    }
+
+    auto& logger = Logger::instance();
+    const std::int64_t now = currentUnixTime();
+
+    const char* updateSql = R"(
+UPDATE files
+SET sync_status = ?, bytes_transferred = ?, updated_at = ?
+WHERE root_id = ? AND rel_path = ?;
+)";
+
+    sqlite3_stmt* statement = nullptr;
+    if (sqlite3_prepare_v2(db_, updateSql, -1, &statement, nullptr) != SQLITE_OK) {
+        logger.error("StateDb::updateTransferProgress: prepare failed: %s",
+                     sqlite3_errmsg(db_));
+        return false;
+    }
+
+    sqlite3_bind_text(statement, 1, FileSyncStatus::kSyncing, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(statement, 2, bytesTransferred);
+    sqlite3_bind_int64(statement, 3, now);
+    sqlite3_bind_int64(statement, 4, rootId);
+    sqlite3_bind_text(statement, 5, relPath.c_str(), -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(statement) != SQLITE_DONE) {
+        logger.error("StateDb::updateTransferProgress: step failed: %s",
+                     sqlite3_errmsg(db_));
+        sqlite3_finalize(statement);
+        return false;
+    }
+
+    const bool updated = sqlite3_changes(db_) > 0;
+    sqlite3_finalize(statement);
+
+    if (!updated) {
+        logger.error(
+            "StateDb::updateTransferProgress: no row updated root_id=<%lld> rel_path=<%s>",
             static_cast<long long>(rootId), relPath.c_str());
     }
 

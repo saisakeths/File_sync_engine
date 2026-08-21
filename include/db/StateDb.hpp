@@ -28,6 +28,7 @@ struct FileRecord {
     std::optional<std::string> hash;
 
     std::string syncStatus;
+    std::int64_t bytesTransferred = 0;
 
     std::int64_t createdAt;
     std::int64_t updatedAt;
@@ -35,6 +36,7 @@ struct FileRecord {
 
 namespace FileSyncStatus {
 inline constexpr const char* kPending = "pending";
+inline constexpr const char* kSyncing = "syncing";
 inline constexpr const char* kSynced = "synced";
 inline constexpr const char* kFailed = "failed";
 inline constexpr const char* kSkipped = "skipped";
@@ -62,6 +64,8 @@ public:
     std::vector<FileRecord> listFilesByStatus(const std::string& syncStatus);
     bool updateSyncStatus(std::int64_t rootId, const std::string& relPath,
                           const std::string& syncStatus);
+    bool updateTransferProgress(std::int64_t rootId, const std::string& relPath,
+                                std::int64_t bytesTransferred);
     bool deleteFile(std::int64_t rootId, const std::string& relPath);
 
     bool isOpen() const;

@@ -15,6 +15,7 @@ add_executable(${PROJECT_NAME}
     src/db/StateDb.cpp
     src/utils/TimeUtils.cpp
     src/sync/SyncBox.cpp
+    src/sync/ChunkCopier.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE include)
