@@ -14,6 +14,7 @@ add_executable(${PROJECT_NAME}
     src/hash/Sha256.cpp
     src/db/StateDb.cpp
     src/utils/TimeUtils.cpp
+    src/utils/ThreadPool.cpp
     src/sync/SyncBox.cpp
     src/sync/ChunkCopier.cpp
 )

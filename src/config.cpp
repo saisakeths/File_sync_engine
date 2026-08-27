@@ -1,8 +1,21 @@
 #include "config.hpp"
+
 #include "logger.hpp"
-#include<iostream>
+
+#include <algorithm>
+#include <iostream>
+#include <thread>
 
 using namespace std;
+
+std::size_t resolveHashWorkerThreads() {
+    if (Config::kHashWorkerThreads > 0) {
+        return Config::kHashWorkerThreads;
+    }
+
+    const unsigned hw = std::thread::hardware_concurrency();
+    return std::max<std::size_t>(1, hw);
+}
 
 bool Config::parse(int argc, char* argv[]){
     auto& logger = fse::Logger::instance();
