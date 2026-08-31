@@ -13,3 +13,4 @@ cmake-build-*/
 logs/
 state/
 *.db
+test_data/

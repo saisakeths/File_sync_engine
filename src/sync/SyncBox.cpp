@@ -4,6 +4,7 @@
 #include "hash/Sha256.hpp"
 #include "logger.hpp"
 #include "sync/ChunkCopier.hpp"
+#include "utils/ThreadPool.hpp"
 #include "utils/TimeUtils.hpp"
 
 #include <chrono>
@@ -97,6 +98,59 @@ bool syncZeroByteFile(IStorage& source,
     return true;
 }
 
+struct HashJob {
+    std::size_t recordIndex;
+    fs::path absPath;
+};
+
+void computeFileHashesParallel(const std::vector<HashJob>& hashJobs,
+                               std::vector<std::optional<std::string>>& outHashes,
+                               std::size_t workerCount) {
+    ThreadPool pool(workerCount);
+
+    for (const HashJob& job : hashJobs) {
+        const std::size_t recordIndex = job.recordIndex;
+        const fs::path absPath = job.absPath;
+
+        pool.submit([&outHashes, recordIndex, absPath]() {
+            outHashes[recordIndex] = hashFile(absPath);
+        });
+    }
+
+    pool.waitAll();
+}
+
+void applyComputedHashes(const std::vector<HashJob>& hashJobs,
+                         std::vector<FileRecord>& records,
+                         const std::vector<std::optional<FileRecord>>& existingSnapshots,
+                         const std::vector<std::optional<std::string>>& computedHashes,
+                         std::size_t& unchanged) {
+    auto& logger = Logger::instance();
+
+    for (const HashJob& job : hashJobs) {
+        FileRecord& record = records[job.recordIndex];
+        const auto& existing = existingSnapshots[job.recordIndex];
+        const auto& hash = computedHashes[job.recordIndex];
+
+        if (hash.has_value()) {
+            record.hash = *hash;
+        } else {
+            logger.warning("SyncBox::scan: failed to hash <%s>",
+                           record.relPath.c_str());
+            record.hash = std::nullopt;
+        }
+
+        if (metadataChanged(existing, record.mtime, record.size, record.hash)) {
+            record.syncStatus = FileSyncStatus::kPending;
+            record.bytesTransferred = 0;
+        } else {
+            record.syncStatus = existing->syncStatus;
+            record.bytesTransferred = existing->bytesTransferred;
+            ++unchanged;
+        }
+    }
+}
+
 bool syncFileChunked(IStorage& source,
                      IStorage& destination,
                      StateDb& db,
@@ -172,9 +226,15 @@ void SyncBox::scan() {
     std::unordered_set<std::string> seenPaths;
     seenPaths.reserve(entries.size());
 
-    std::size_t upserted = 0;
+    std::vector<FileRecord> records;
+    records.reserve(entries.size());
+    std::vector<std::optional<FileRecord>> existingSnapshots;
+    existingSnapshots.reserve(entries.size());
+    std::vector<HashJob> hashJobs;
     std::size_t unchanged = 0;
+    std::size_t destMissingReset = 0;
 
+  // Pass 1 — collect (serial DB reads)
     for (const auto& info : entries) {
         seenPaths.insert(info.relPath);
 
@@ -200,29 +260,50 @@ void SyncBox::scan() {
 
             if (mtimeOrSizeChanged) {
                 const fs::path absPath = fs::path(sourceRootPath_) / info.relPath;
-                if (const auto hash = hashFile(absPath)) {
-                    record.hash = *hash;
-                } else {
-                    logger.warning("SyncBox::scan: failed to hash <%s>",
-                                   info.relPath.c_str());
-                    record.hash = std::nullopt;
-                }
+                const std::size_t recordIndex = records.size();
+                hashJobs.push_back({recordIndex, absPath});
             } else {
                 record.hash = existing->hash;
-            }
-
-            if (metadataChanged(existing, record.mtime, record.size, record.hash)) {
-                record.syncStatus = FileSyncStatus::kPending;
-                record.bytesTransferred = 0;
-            } else {
                 record.syncStatus = existing->syncStatus;
                 record.bytesTransferred = existing->bytesTransferred;
-                ++unchanged;
+
+                const bool destMissing = !destination_.exist(info.relPath);
+                if (destMissing &&
+                    existing->syncStatus == FileSyncStatus::kSynced) {
+                    record.syncStatus = FileSyncStatus::kPending;
+                    record.bytesTransferred = 0;
+                    ++destMissingReset;
+                } else {
+                    ++unchanged;
+                }
             }
         }
 
+        records.push_back(record);
+        existingSnapshots.push_back(existing);
+    }
+
+  // Pass 2 — hash (parallel via ThreadPool)
+    // const std::size_t workerCount = 1;
+    const std::size_t workerCount = resolveHashWorkerThreads();
+    if (!hashJobs.empty()) {
+        std::vector<std::optional<std::string>> computedHashes(records.size());
+
+        computeFileHashesParallel(hashJobs, computedHashes, workerCount);
+
+        logger.info("SyncBox::scan: hash_jobs=%zu workers=%zu",
+                    hashJobs.size(), workerCount);
+
+        applyComputedHashes(hashJobs, records, existingSnapshots, computedHashes,
+                            unchanged);
+    }
+
+  // Pass 3 — persist (serial DB writes)
+    std::size_t upserted = 0;
+
+    for (const FileRecord& record : records) {
         if (db_.upsertFile(record) < 0) {
-            logger.error("SyncBox::scan: upsert failed for <%s>", info.relPath.c_str());
+            logger.error("SyncBox::scan: upsert failed for <%s>", record.relPath.c_str());
             continue;
         }
 
@@ -247,9 +328,17 @@ void SyncBox::scan() {
         }
     }
 
+    std::size_t pendingToSync = 0;
+    for (const FileRecord& record : records) {
+        if (record.syncStatus == FileSyncStatus::kPending) {
+            ++pendingToSync;
+        }
+    }
+
     logger.info(
-        "SyncBox::scan: scanned=%zu upserted=%zu unchanged=%zu marked_deleted=%zu",
-        entries.size(), upserted, unchanged, markedDeleted);
+        "SyncBox::scan: scanned=%zu upserted=%zu unchanged=%zu dest_missing_reset=%zu pending_to_sync=%zu marked_deleted=%zu",
+        entries.size(), upserted, unchanged, destMissingReset, pendingToSync,
+        markedDeleted);
 }
 
 void SyncBox::sync() {
